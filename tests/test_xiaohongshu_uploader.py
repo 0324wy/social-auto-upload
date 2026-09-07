@@ -3,7 +3,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import uploader.xiaohongshu_uploader.main as xhs_main
 
@@ -243,7 +243,7 @@ class XiaohongshuUploaderTests(unittest.TestCase):
         self.assertIn(("type", "#话题1", 30), page.keyboard.actions)
         self.assertEqual(
             page.locators['#creator-editor-topic-container .item'].actions,
-            [("wait_for", {"state": "visible", "timeout": 2000}), ("click",)],
+            [("wait_for", {"state": "visible", "timeout": 4000}), ("click",)],
         )
 
     def test_video_fill_meta_can_fill_first_tag_without_desc(self):
@@ -264,6 +264,87 @@ class XiaohongshuUploaderTests(unittest.TestCase):
         )
         self.assertNotIn(("type", "", None), page.keyboard.actions)
         self.assertIn(("type", "#话题1", 30), page.keyboard.actions)
+
+    def test_missing_repost_source_skips_declaration_controls(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="标题内容",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+        )
+        page = MagicMock()
+
+        asyncio.run(app.check_original_declaration(page))
+
+        page.get_by_text.assert_not_called()
+
+    def test_context_close_failure_still_closes_browser(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="标题内容",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+        )
+        app.validate_upload_args = AsyncMock()
+        app.upload_video_content = AsyncMock(side_effect=RuntimeError("upload failed"))
+
+        page = MagicMock()
+        context = MagicMock()
+        context.new_page = AsyncMock(return_value=page)
+        context.close = AsyncMock(side_effect=OSError("close failed"))
+        browser = MagicMock()
+        browser.new_context = AsyncMock(return_value=context)
+        browser.close = AsyncMock()
+        playwright = MagicMock()
+        playwright.chromium.launch = AsyncMock(return_value=browser)
+
+        with (
+            patch.object(xhs_main, "set_init_script", AsyncMock(return_value=context)),
+            self.assertRaisesRegex(RuntimeError, "upload failed"),
+        ):
+            asyncio.run(app.upload(playwright))
+
+        context.close.assert_awaited_once()
+        browser.close.assert_awaited_once()
+
+    def test_upload_timeout_closes_browser_resources(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="标题内容",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+        )
+        app.validate_upload_args = AsyncMock()
+
+        locator = MagicMock()
+        locator.first = locator
+        locator.set_input_files = AsyncMock()
+        page = MagicMock()
+        page.goto = AsyncMock()
+        page.wait_for_url = AsyncMock()
+        page.locator.return_value = locator
+
+        context = MagicMock()
+        context.new_page = AsyncMock(return_value=page)
+        context.close = AsyncMock(side_effect=OSError("close failed"))
+        browser = MagicMock()
+        browser.new_context = AsyncMock(return_value=context)
+        browser.close = AsyncMock()
+        playwright = MagicMock()
+        playwright.chromium.launch = AsyncMock(return_value=browser)
+
+        with (
+            patch.object(xhs_main, "set_init_script", AsyncMock(return_value=context)),
+            patch.object(xhs_main, "monotonic", side_effect=[0, 901]),
+            self.assertRaisesRegex(TimeoutError, "15 分钟"),
+        ):
+            asyncio.run(app.upload(playwright))
+
+        context.close.assert_awaited_once()
+        browser.close.assert_awaited_once()
 
     def test_note_title_defaults_do_not_override_explicit_title(self):
         app = xhs_main.XiaoHongShuNote(

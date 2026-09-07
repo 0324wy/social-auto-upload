@@ -6,6 +6,7 @@ import inspect
 import os
 from datetime import datetime
 from pathlib import Path
+from time import monotonic
 
 from patchright.async_api import Page
 from patchright.async_api import Playwright
@@ -28,6 +29,8 @@ XHS_LOGIN_BOX_SELECTOR = "div[class*='login-box']"
 XHS_LOGIN_SWITCH_SELECTOR = "img.css-wemwzq"
 XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
+VIDEO_UPLOAD_TIMEOUT_SECONDS = 15 * 60
+PUBLISH_TIMEOUT_SECONDS = 5 * 60
 
 
 def _build_xhs_creator_url(path: str) -> str:
@@ -42,6 +45,20 @@ def _build_xhs_creator_url(path: str) -> str:
 
 def _msg(emoji: str, text: str) -> str:
     return f"{emoji} {text}"
+
+
+async def _close_browser_resources(context, browser) -> None:
+    """Best-effort cleanup that never masks the original upload error."""
+    if context is not None:
+        try:
+            await context.close()
+        except Exception as exc:
+            xiaohongshu_logger.warning(_msg("⚠️", f"关闭浏览器上下文失败: {exc}"))
+    if browser is not None:
+        try:
+            await browser.close()
+        except Exception as exc:
+            xiaohongshu_logger.warning(_msg("⚠️", f"关闭浏览器失败: {exc}"))
 
 
 async def _js_click_by_text(page: Page, text: str) -> bool:
@@ -474,7 +491,9 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
           → 填 placeholder「请输入媒体名称」→ 点 button「确认」。
         容错：任一步失败记 warning 跳过、继续发布，不中断。
         """
-        source = getattr(self, "repost_source", "") or ""
+        source = (getattr(self, "repost_source", "") or "").strip()
+        if not source:
+            return
         try:
             # 1. 点「添加内容类型声明」
             trigger = page.get_by_text("添加内容类型声明", exact=False).first
@@ -630,7 +649,8 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         await page.wait_for_url(publish_url)
         await page.locator("div[class^='upload-content'] input[class='upload-input']").set_input_files(self.file_path)
 
-        while True:
+        upload_deadline = monotonic() + VIDEO_UPLOAD_TIMEOUT_SECONDS
+        while monotonic() < upload_deadline:
             try:
                 upload_input = await page.wait_for_selector('input.upload-input', timeout=3000)
                 preview_new = await upload_input.query_selector(
@@ -667,6 +687,8 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
             except Exception as e:
                 xiaohongshu_logger.debug(_msg("😵", f"上传状态还没稳定下来，小人继续观察: {e}"))
             await asyncio.sleep(2)
+        else:
+            raise TimeoutError("等待小红书视频上传完成超时（15 分钟）")
 
         xiaohongshu_logger.info(_msg("✍️", "小人开始填标题、描述和话题"))
         await self.fill_meta(page)
@@ -680,7 +702,8 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_xiaohongshu(page, self.publish_date)
 
-        while True:
+        publish_deadline = monotonic() + PUBLISH_TIMEOUT_SECONDS
+        while monotonic() < publish_deadline:
             try:
                 if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
                     await page.locator('button:has-text("定时发布")').click()
@@ -697,26 +720,29 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
                 if self.debug:
                     await page.screenshot(full_page=True)
                 await asyncio.sleep(0.5)
+        else:
+            raise TimeoutError("等待小红书视频发布结果超时（5 分钟）")
 
     async def upload(self, playwright: Playwright) -> None:
         xiaohongshu_logger.info(_msg("🧍", "小人先检查 cookie、视频文件、封面和发布时间"))
         await self.validate_upload_args()
         xiaohongshu_logger.info(_msg("🥳", "上传前检查通过"))
-        browser = await playwright.chromium.launch(headless=self.headless, channel="chromium")
-        context = await browser.new_context(
-            permissions=["geolocation"],
-            storage_state=self.account_file,
-        )
-        context = await set_init_script(context)
+        browser = None
+        context = None
 
         try:
+            browser = await playwright.chromium.launch(headless=self.headless, channel="chromium")
+            context = await browser.new_context(
+                permissions=["geolocation"],
+                storage_state=self.account_file,
+            )
+            context = await set_init_script(context)
             page = await context.new_page()
             await self.upload_video_content(page)
             await context.storage_state(path=self.account_file)
             xiaohongshu_logger.success(_msg("🥳", "cookie 更新完毕"))
         finally:
-            await context.close()
-            await browser.close()
+            await _close_browser_resources(context, browser)
 
     async def xiaohongshu_upload_video(self):
         async with async_playwright() as playwright:
@@ -785,7 +811,8 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         xiaohongshu_logger.info(_msg("📤", "小人正在上传图片"))
         await upload_input.set_input_files(self.image_paths)
 
-        while True:
+        upload_deadline = monotonic() + VIDEO_UPLOAD_TIMEOUT_SECONDS
+        while monotonic() < upload_deadline:
             try:
                 title_container = page.locator('input[placeholder*="填写标题"]').first
                 await title_container.wait_for(state="visible", timeout=3000)
@@ -794,6 +821,8 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
             except Exception:
                 xiaohongshu_logger.debug(_msg("🧍", "图文素材还在上传，小人继续等一会"))
                 await asyncio.sleep(1)
+        else:
+            raise TimeoutError("等待小红书图文上传完成超时（15 分钟）")
 
         xiaohongshu_logger.info(_msg("✍️", "小人开始填标题、描述和话题"))
         await self.fill_meta(page)
@@ -803,7 +832,8 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
         if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
             await self.set_schedule_time_xiaohongshu(page, self.publish_date)
 
-        while True:
+        publish_deadline = monotonic() + PUBLISH_TIMEOUT_SECONDS
+        while monotonic() < publish_deadline:
             try:
                 if self.publish_strategy == XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED:
                     await page.locator('button:has-text("定时发布")').click()
@@ -820,26 +850,29 @@ class XiaoHongShuNote(XiaoHongShuBaseUploader):
                 if self.debug:
                     await page.screenshot(full_page=True)
                 await asyncio.sleep(0.5)
+        else:
+            raise TimeoutError("等待小红书图文发布结果超时（5 分钟）")
 
     async def upload(self, playwright: Playwright) -> None:
         xiaohongshu_logger.info(_msg("🧍", "小人先检查 cookie、图片和发布时间"))
         await self.validate_upload_args()
         xiaohongshu_logger.info(_msg("🥳", "图文上传前检查通过"))
-        browser = await playwright.chromium.launch(headless=self.headless, channel="chromium")
-        context = await browser.new_context(
-            permissions=["geolocation"],
-            storage_state=self.account_file,
-        )
-        context = await set_init_script(context)
+        browser = None
+        context = None
 
         try:
+            browser = await playwright.chromium.launch(headless=self.headless, channel="chromium")
+            context = await browser.new_context(
+                permissions=["geolocation"],
+                storage_state=self.account_file,
+            )
+            context = await set_init_script(context)
             page = await context.new_page()
             await self.upload_note_content(page)
             await context.storage_state(path=self.account_file)
             xiaohongshu_logger.success(_msg("🥳", "cookie 更新完毕"))
         finally:
-            await context.close()
-            await browser.close()
+            await _close_browser_resources(context, browser)
 
     async def xiaohongshu_upload_note(self):
         async with async_playwright() as playwright:

@@ -66,11 +66,14 @@ class DouyinDeclarationTests(unittest.TestCase):
         video.apply_self_declaration = AsyncMock(side_effect=RuntimeError("抖音自主声明设置失败"))
 
         locator = MagicMock()
+        locator.first = locator
         locator.set_input_files = AsyncMock()
         locator.count = AsyncMock(return_value=1)
+        locator.wait_for = AsyncMock()
         page = MagicMock()
         page.goto = AsyncMock()
         page.wait_for_url = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
         page.wait_for_selector = AsyncMock()
         page.locator.return_value = locator
 
@@ -87,6 +90,40 @@ class DouyinDeclarationTests(unittest.TestCase):
             patch.object(douyin_main, "set_init_script", AsyncMock(return_value=context)),
             patch.object(douyin_main.asyncio, "sleep", AsyncMock()),
             self.assertRaisesRegex(RuntimeError, "自主声明"),
+        ):
+            asyncio.run(video.upload(playwright))
+
+        context.close.assert_awaited_once()
+        browser.close.assert_awaited_once()
+
+    def test_upload_timeout_closes_browser_resources(self):
+        video = DouYinVideo("标题", "/tmp/demo.mp4", [], 0, "/tmp/cookie.json")
+        video.validate_upload_args = AsyncMock()
+
+        locator = MagicMock()
+        locator.first = locator
+        locator.count = AsyncMock(return_value=1)
+        locator.wait_for = AsyncMock()
+        locator.set_input_files = AsyncMock()
+        page = MagicMock()
+        page.goto = AsyncMock()
+        page.wait_for_url = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        page.locator.return_value = locator
+
+        context = MagicMock()
+        context.new_page = AsyncMock(return_value=page)
+        context.close = AsyncMock()
+        browser = MagicMock()
+        browser.new_context = AsyncMock(return_value=context)
+        browser.close = AsyncMock()
+        playwright = MagicMock()
+        playwright.chromium.launch = AsyncMock(return_value=browser)
+
+        with (
+            patch.object(douyin_main, "set_init_script", AsyncMock(return_value=context)),
+            patch.object(douyin_main, "monotonic", side_effect=[0, 901]),
+            self.assertRaisesRegex(TimeoutError, "15 分钟"),
         ):
             asyncio.run(video.upload(playwright))
 
