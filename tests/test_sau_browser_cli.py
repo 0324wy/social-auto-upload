@@ -174,6 +174,33 @@ class BrowserCliParserTests(unittest.TestCase):
             )
 
         self.assertTrue(args.headless)
+        self.assertIsNone(args.group_chat)
+        self.assertIsNone(args.quote_note)
+
+    def test_xiaohongshu_upload_video_accepts_content_associations(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            video_path = Path(tmp_dir) / "demo.mp4"
+            video_path.write_bytes(b"video")
+
+            args = sau_cli.build_parser().parse_args(
+                [
+                    "xiaohongshu",
+                    "upload-video",
+                    "--account",
+                    "creator",
+                    "--file",
+                    str(video_path),
+                    "--title",
+                    "视频标题",
+                    "--group-chat",
+                    "语流 内测群",
+                    "--quote-note",
+                    "右滑15秒英语听力满级",
+                ]
+            )
+
+        self.assertEqual(args.group_chat, "语流 内测群")
+        self.assertEqual(args.quote_note, "右滑15秒英语听力满级")
 
     def test_xiaohongshu_upload_note_accepts_headed(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -312,6 +339,8 @@ class BrowserCliDispatchTests(unittest.TestCase):
             thumbnail=None,
             debug=False,
             headless=False,
+            group_chat="语流 内测群",
+            quote_note="右滑15秒英语听力满级",
         )
         with patch("sau_cli.upload_xiaohongshu_video", new=AsyncMock()) as mock_upload:
             asyncio.run(sau_cli.dispatch(args))
@@ -320,6 +349,31 @@ class BrowserCliDispatchTests(unittest.TestCase):
         self.assertEqual(request.title, "视频标题")
         self.assertEqual(request.description, "视频简介")
         self.assertFalse(request.headless)
+        self.assertEqual(request.group_chat, "语流 内测群")
+        self.assertEqual(request.quote_note, "右滑15秒英语听力满级")
+
+    def test_upload_xiaohongshu_video_forwards_associations_to_uploader(self):
+        request = sau_cli.XiaohongshuVideoUploadRequest(
+            account_name="creator",
+            video_file=Path("demo.mp4"),
+            title="视频标题",
+            description="",
+            tags=[],
+            publish_date=0,
+            group_chat="语流 内测群",
+            quote_note="右滑15秒英语听力满级",
+        )
+
+        with (
+            patch("sau_cli.xiaohongshu_setup", new=AsyncMock(return_value=True)),
+            patch("sau_cli.XiaoHongShuVideo") as uploader_class,
+        ):
+            uploader_class.return_value.main = AsyncMock()
+            asyncio.run(sau_cli.upload_xiaohongshu_video(request))
+
+        kwargs = uploader_class.call_args.kwargs
+        self.assertEqual(kwargs["group_chat"], "语流 内测群")
+        self.assertEqual(kwargs["quote_note"], "右滑15秒英语听力满级")
 
     def test_dispatch_xiaohongshu_upload_note_uses_headless_request(self):
         args = Namespace(

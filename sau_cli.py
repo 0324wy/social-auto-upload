@@ -144,6 +144,8 @@ class XiaohongshuVideoUploadRequest:
     publish_strategy: str = XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE
     debug: bool = True
     headless: bool = True
+    group_chat: str | None = None
+    quote_note: str | None = None
 
 
 @dataclass(slots=True)
@@ -530,6 +532,8 @@ async def upload_xiaohongshu_video(request: XiaohongshuVideoUploadRequest) -> Pa
         publish_strategy=request.publish_strategy,
         debug=request.debug,
         headless=request.headless,
+        group_chat=request.group_chat,
+        quote_note=request.quote_note,
     )
     await app.main()
     return account_file
@@ -882,6 +886,14 @@ def build_parser() -> argparse.ArgumentParser:
     xiaohongshu_upload_video_parser.add_argument("--tags", default="", help="Comma-separated tags, such as tag1,tag2")
     xiaohongshu_upload_video_parser.add_argument("--schedule", type=schedule_value, help=f"Schedule time in {schedule_help}")
     xiaohongshu_upload_video_parser.add_argument("--thumbnail", type=existing_file_path, help="Optional thumbnail path")
+    xiaohongshu_upload_video_parser.add_argument(
+        "--group-chat",
+        help="Exact displayed group-chat name to associate; missing or duplicate matches are skipped",
+    )
+    xiaohongshu_upload_video_parser.add_argument(
+        "--quote-note",
+        help="Exact displayed title of an existing note to quote; missing or duplicate matches are skipped",
+    )
     add_runtime_flags(xiaohongshu_upload_video_parser)
 
     xiaohongshu_upload_note_parser = xiaohongshu_actions.add_parser("upload-note", help="Upload one note to Xiaohongshu")
@@ -1188,6 +1200,8 @@ async def dispatch(args: argparse.Namespace) -> int:
                 publish_strategy=publish_strategy,
                 debug=args.debug,
                 headless=args.headless,
+                group_chat=getattr(args, "group_chat", None),
+                quote_note=getattr(args, "quote_note", None),
             )
             await upload_xiaohongshu_video(request)
             print(f"Xiaohongshu video upload submitted: {request.video_file}")

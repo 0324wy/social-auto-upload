@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
@@ -60,6 +61,27 @@ COVER_CURRENT_SURFACE_SELECTOR = (
     "div.cover-plugin-preview div.default--ai-cover-layout"
 )
 COVER_EVALUATING_TEXT = "封面效果评估中"
+GROUP_CHAT_POPOVER_SELECTOR = "div.d-popover.d-dropdown:visible"
+GROUP_CHAT_OPTION_NAME_SELECTOR = ".item.custom-option .name"
+QUOTE_NOTE_MODAL_SELECTOR = "div.d-modal.select-note-modal:visible"
+QUOTE_NOTE_CARD_TITLE_SELECTOR = ".select-note-modal__note-grid .note-card__title"
+QUOTE_NOTE_SELECTED_SELECTOR = ".quote-note-container__selected-text"
+
+
+def _normalize_display_text(value: object) -> str:
+    """Normalize rendered whitespace while preserving exact displayed wording."""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+async def _has_visible_exact_text(container, text: str) -> bool:
+    matches = container.get_by_text(text, exact=True)
+    for index in range(await matches.count()):
+        try:
+            if await matches.nth(index).is_visible():
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _build_xhs_creator_url(path: str) -> str:
@@ -627,6 +649,8 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         publish_strategy: str = XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE,
         debug: bool = DEBUG_MODE,
         headless: bool = LOCAL_CHROME_HEADLESS,
+        group_chat: str | None = None,
+        quote_note: str | None = None,
     ):
         super().__init__(
             publish_date=publish_date,
@@ -640,6 +664,8 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         self.tags = tags or []
         self.thumbnail_path = thumbnail_path
         self.desc = desc or ""
+        self.group_chat = (group_chat or "").strip()
+        self.quote_note = (quote_note or "").strip()
 
     async def validate_upload_args(self):
         await self.validate_base_args()
@@ -760,6 +786,181 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
                 pass
             raise RuntimeError("小红书自定义封面设置失败，已停止发布") from exc
 
+    def _group_chat_popover(self, page: Page):
+        return page.locator(GROUP_CHAT_POPOVER_SELECTOR).filter(
+            has=page.get_by_text("我创建的群聊", exact=True)
+        ).last
+
+    async def _open_group_chat_popover(self, page: Page):
+        """Open the group selector, including when another group is selected."""
+        popover = self._group_chat_popover(page)
+        placeholder = page.get_by_text("选择群聊", exact=True).first
+        try:
+            if await placeholder.count() and await placeholder.is_visible():
+                await placeholder.click(force=True)
+                await popover.wait_for(state="visible", timeout=5000)
+                return popover
+        except Exception:
+            pass
+
+        # Once a group is selected, Xiaohongshu replaces the placeholder with
+        # its name. Probe visible selects and identify the right one by the
+        # distinctive dropdown heading instead of relying on generated classes.
+        selects = page.locator("#publish-container .d-select:visible")
+        for index in range(await selects.count()):
+            candidate = selects.nth(index)
+            try:
+                await candidate.click(force=True)
+                await popover.wait_for(state="visible", timeout=800)
+                return popover
+            except Exception:
+                try:
+                    await page.keyboard.press("Escape")
+                except Exception:
+                    pass
+        raise RuntimeError("没有找到『选择群聊』控件")
+
+    async def _has_selected_group_chat(self, page: Page, target: str) -> bool:
+        selects = page.locator("#publish-container .d-select:visible")
+        return await _has_visible_exact_text(selects, target)
+
+    async def apply_group_chat(self, page: Page) -> bool:
+        """Select one uniquely named group chat; warn and continue on failure."""
+        target = self.group_chat
+        if not target:
+            return True
+        try:
+            if await self._has_selected_group_chat(page, target):
+                xiaohongshu_logger.info(_msg("👥", f"群聊已经是『{target}』"))
+                return True
+
+            popover = await self._open_group_chat_popover(page)
+            names = popover.locator(GROUP_CHAT_OPTION_NAME_SELECTOR)
+            await names.first.wait_for(state="visible", timeout=5000)
+            rendered_names = await names.all_inner_texts()
+            matching_indexes = [
+                index
+                for index, name in enumerate(rendered_names)
+                if _normalize_display_text(name) == target
+            ]
+            if len(matching_indexes) != 1:
+                reason = "未找到" if not matching_indexes else "找到多个同名群聊"
+                xiaohongshu_logger.warning(
+                    _msg("⚠️", f"{reason}『{target}』，跳过群聊关联并继续发布")
+                )
+                await page.keyboard.press("Escape")
+                return False
+
+            option = names.nth(matching_indexes[0]).locator(
+                "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' custom-option ')][1]"
+            )
+            await option.click(force=True)
+            await popover.wait_for(state="hidden", timeout=5000)
+            if not await self._has_selected_group_chat(page, target):
+                raise RuntimeError("选择后未能验证页面中的群聊名称")
+            xiaohongshu_logger.success(_msg("👥", f"已关联群聊：{target}"))
+            return True
+        except Exception as exc:
+            xiaohongshu_logger.warning(
+                _msg("⚠️", f"关联群聊『{target}』失败，跳过并继续发布: {exc}")
+            )
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return False
+
+    async def _has_quoted_note(self, page: Page, target: str) -> bool:
+        selected = page.locator(QUOTE_NOTE_SELECTED_SELECTOR)
+        for rendered_text in await selected.all_inner_texts():
+            titles = re.findall(r"《(.*?)》", rendered_text, flags=re.DOTALL)
+            if any(_normalize_display_text(title) == target for title in titles):
+                return True
+        return False
+
+    async def apply_quote_note(self, page: Page) -> bool:
+        """Quote one uniquely titled own note; warn and continue on failure."""
+        target = self.quote_note
+        if not target:
+            return True
+        try:
+            if await self._has_quoted_note(page, target):
+                xiaohongshu_logger.info(_msg("🔗", f"已经引用笔记『{target}』"))
+                return True
+
+            trigger = page.get_by_text("引用笔记", exact=True).first
+            try:
+                await trigger.scroll_into_view_if_needed(timeout=5000)
+            except Exception:
+                pass
+            try:
+                await trigger.click(force=True)
+            except Exception:
+                if not await _js_click_by_text(page, "引用笔记"):
+                    raise RuntimeError("没有找到『引用笔记』控件")
+
+            modal = page.locator(QUOTE_NOTE_MODAL_SELECTOR).last
+            await modal.wait_for(state="visible", timeout=5000)
+            own_notes_tab = modal.get_by_role(
+                "button", name="我的笔记", exact=True
+            ).first
+            if await own_notes_tab.count():
+                await own_notes_tab.click(force=True)
+                await page.wait_for_timeout(300)
+
+            titles = modal.locator(QUOTE_NOTE_CARD_TITLE_SELECTOR)
+            await titles.first.wait_for(state="visible", timeout=8000)
+            rendered_titles = await titles.all_inner_texts()
+            matching_indexes = [
+                index
+                for index, title in enumerate(rendered_titles)
+                if _normalize_display_text(title) == target
+            ]
+            if len(matching_indexes) != 1:
+                reason = "未找到" if not matching_indexes else "找到多篇同名笔记"
+                xiaohongshu_logger.warning(
+                    _msg("⚠️", f"{reason}『{target}』，跳过引用并继续发布")
+                )
+                await page.keyboard.press("Escape")
+                return False
+
+            card = titles.nth(matching_indexes[0]).locator(
+                "xpath=ancestor::*[contains(concat(' ', normalize-space(@class), ' '), ' note-card ')][1]"
+            )
+            await card.click(force=True)
+            confirm = modal.get_by_role(
+                "button", name="确认引用", exact=True
+            ).first
+            await confirm.wait_for(state="visible", timeout=5000)
+            await confirm.click(force=True)
+            await modal.wait_for(state="hidden", timeout=5000)
+            if not await self._has_quoted_note(page, target):
+                raise RuntimeError("确认后未能验证页面中的引用笔记标题")
+            xiaohongshu_logger.success(_msg("🔗", f"已引用笔记：{target}"))
+            return True
+        except Exception as exc:
+            xiaohongshu_logger.warning(
+                _msg("⚠️", f"引用笔记『{target}』失败，跳过并继续发布: {exc}")
+            )
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return False
+
+    async def apply_content_associations(self, page: Page) -> None:
+        """Apply optional associations independently and never block publish."""
+        for label, apply_association in (
+            ("群聊", self.apply_group_chat),
+            ("引用笔记", self.apply_quote_note),
+        ):
+            try:
+                await apply_association(page)
+            except Exception as exc:
+                xiaohongshu_logger.warning(
+                    _msg("⚠️", f"设置{label}时发生异常，跳过并继续发布: {exc}")
+                )
+
     async def upload_video_content(self, page: Page) -> None:
         xiaohongshu_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}.mp4"))
         xiaohongshu_logger.info(_msg("🧭", "小人正在赶往视频发布页"))
@@ -815,6 +1016,8 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         await self.fill_meta(page)
 
         await self.set_thumbnail(page, self.thumbnail_path)
+
+        await self.apply_content_associations(page)
 
         # await self.set_location(page, "青岛市")
 

@@ -530,6 +530,271 @@ class XiaohongshuUploaderTests(unittest.TestCase):
             page.locator.call_args_list,
         )
 
+    def test_video_applies_content_associations_before_publish(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="标题内容",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+        )
+        events = []
+        upload_file = make_async_locator("upload-file")
+        publish_button = make_async_locator("publish-button")
+        publish_button.click.side_effect = lambda: events.append("publish")
+        upload_input = MagicMock()
+        preview = MagicMock()
+        preview.inner_text = AsyncMock(return_value="上传成功")
+        upload_input.query_selector = AsyncMock(return_value=preview)
+        page = MagicMock()
+        page.goto = AsyncMock()
+        page.wait_for_url = AsyncMock()
+        page.wait_for_selector = AsyncMock(return_value=upload_input)
+        page.locator.side_effect = lambda selector: (
+            publish_button
+            if selector == 'button:has-text("发布")'
+            else upload_file
+        )
+        app.fill_meta = AsyncMock()
+        app.set_thumbnail = AsyncMock(
+            side_effect=lambda *_args: events.append("thumbnail")
+        )
+        app.apply_content_associations = AsyncMock(
+            side_effect=lambda *_args: events.append("associations")
+        )
+        app.check_original_declaration = AsyncMock(
+            side_effect=lambda *_args: events.append("declaration")
+        )
+
+        asyncio.run(app.upload_video_content(page))
+
+        self.assertEqual(
+            events, ["thumbnail", "associations", "declaration", "publish"]
+        )
+
+    def test_group_chat_selects_one_exact_match_and_verifies_it(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="标题内容",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+            group_chat="语流 内测群",
+        )
+        page = MagicMock()
+        popover = make_async_locator("group-popover")
+        names = make_async_locator("group-names")
+        names.all_inner_texts = AsyncMock(
+            return_value=["「DeepClip」内测群", " 语流   内测群 "]
+        )
+        target_name = make_async_locator("target-name")
+        option = make_async_locator("target-option")
+        target_name.locator.return_value = option
+        names.nth.return_value = target_name
+        popover.locator.return_value = names
+
+        with (
+            patch.object(
+                app,
+                "_has_selected_group_chat",
+                new=AsyncMock(side_effect=[False, True]),
+            ),
+            patch.object(
+                app,
+                "_open_group_chat_popover",
+                new=AsyncMock(return_value=popover),
+            ),
+        ):
+            result = asyncio.run(app.apply_group_chat(page))
+
+        self.assertTrue(result)
+        names.nth.assert_called_once_with(1)
+        option.click.assert_awaited_once_with(force=True)
+        popover.wait_for.assert_awaited_once_with(state="hidden", timeout=5000)
+
+    def test_group_chat_missing_or_duplicate_warns_and_continues(self):
+        for rendered_names in (
+            ["另一个群"],
+            ["语流 内测群", "语流 内测群"],
+        ):
+            with self.subTest(rendered_names=rendered_names):
+                app = xhs_main.XiaoHongShuVideo(
+                    title="标题内容",
+                    file_path="demo.mp4",
+                    tags=[],
+                    publish_date=0,
+                    account_file="account.json",
+                    group_chat="语流 内测群",
+                )
+                page = MagicMock()
+                page.keyboard.press = AsyncMock()
+                popover = make_async_locator("group-popover")
+                names = make_async_locator("group-names")
+                names.all_inner_texts = AsyncMock(return_value=rendered_names)
+                popover.locator.return_value = names
+
+                with (
+                    patch.object(
+                        app,
+                        "_has_selected_group_chat",
+                        new=AsyncMock(return_value=False),
+                    ),
+                    patch.object(
+                        app,
+                        "_open_group_chat_popover",
+                        new=AsyncMock(return_value=popover),
+                    ),
+                    patch.object(xhs_main.xiaohongshu_logger, "warning") as warning,
+                ):
+                    result = asyncio.run(app.apply_group_chat(page))
+
+                self.assertFalse(result)
+                warning.assert_called_once()
+                page.keyboard.press.assert_awaited_once_with("Escape")
+
+    def test_group_chat_already_selected_is_a_noop(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="标题内容",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+            group_chat="语流 内测群",
+        )
+        page = MagicMock()
+
+        with (
+            patch.object(
+                app,
+                "_has_selected_group_chat",
+                new=AsyncMock(return_value=True),
+            ),
+            patch.object(
+                app,
+                "_open_group_chat_popover",
+                new=AsyncMock(),
+            ) as open_popover,
+        ):
+            result = asyncio.run(app.apply_group_chat(page))
+
+        self.assertTrue(result)
+        open_popover.assert_not_awaited()
+
+    def test_quote_note_selects_one_exact_match_confirms_and_verifies_it(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="标题内容",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+            quote_note="右滑15秒英语听力满级",
+        )
+        trigger = make_async_locator("quote-trigger")
+        own_notes_tab = make_async_locator("own-notes-tab")
+        confirm = make_async_locator("confirm-quote")
+        card = make_async_locator("target-card")
+        target_title = make_async_locator("target-title")
+        target_title.locator.return_value = card
+        titles = make_async_locator("note-titles")
+        titles.all_inner_texts = AsyncMock(
+            return_value=["别的笔记", " 右滑15秒英语听力满级 "]
+        )
+        titles.nth.return_value = target_title
+        modal = make_async_locator("quote-modal")
+        modal.locator.return_value = titles
+        modal.get_by_role.side_effect = lambda _role, name, **_kwargs: (
+            own_notes_tab if name == "我的笔记" else confirm
+        )
+        modal_container = MagicMock()
+        modal_container.last = modal
+        page = MagicMock()
+        page.get_by_text.return_value = trigger
+        page.locator.return_value = modal_container
+        page.wait_for_timeout = AsyncMock()
+
+        with patch.object(
+            app,
+            "_has_quoted_note",
+            new=AsyncMock(side_effect=[False, True]),
+        ):
+            result = asyncio.run(app.apply_quote_note(page))
+
+        self.assertTrue(result)
+        titles.nth.assert_called_once_with(1)
+        card.click.assert_awaited_once_with(force=True)
+        confirm.click.assert_awaited_once_with(force=True)
+        modal.wait_for.assert_any_await(state="hidden", timeout=5000)
+
+    def test_quote_note_duplicate_warns_and_continues(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="标题内容",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+            quote_note="右滑15秒英语听力满级",
+        )
+        trigger = make_async_locator("quote-trigger")
+        own_notes_tab = make_async_locator("own-notes-tab", count=0)
+        titles = make_async_locator("note-titles")
+        titles.all_inner_texts = AsyncMock(
+            return_value=["右滑15秒英语听力满级", "右滑15秒英语听力满级"]
+        )
+        modal = make_async_locator("quote-modal")
+        modal.locator.return_value = titles
+        modal.get_by_role.return_value = own_notes_tab
+        modal_container = MagicMock()
+        modal_container.last = modal
+        page = MagicMock()
+        page.get_by_text.return_value = trigger
+        page.locator.return_value = modal_container
+        page.keyboard.press = AsyncMock()
+
+        with (
+            patch.object(
+                app, "_has_quoted_note", new=AsyncMock(return_value=False)
+            ),
+            patch.object(xhs_main.xiaohongshu_logger, "warning") as warning,
+        ):
+            result = asyncio.run(app.apply_quote_note(page))
+
+        self.assertFalse(result)
+        warning.assert_called_once()
+        page.keyboard.press.assert_awaited_once_with("Escape")
+
+    def test_content_association_failures_are_independent_and_fail_open(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="标题内容",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+            group_chat="语流 内测群",
+            quote_note="右滑15秒英语听力满级",
+        )
+        app.apply_group_chat = AsyncMock(side_effect=RuntimeError("group failed"))
+        app.apply_quote_note = AsyncMock(return_value=True)
+
+        asyncio.run(app.apply_content_associations(MagicMock()))
+
+        app.apply_group_chat.assert_awaited_once()
+        app.apply_quote_note.assert_awaited_once()
+
+    def test_omitted_content_associations_touch_no_page_controls(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="标题内容",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+        )
+        page = MagicMock()
+
+        asyncio.run(app.apply_content_associations(page))
+
+        page.locator.assert_not_called()
+        page.get_by_text.assert_not_called()
+
     def test_note_uploader_exists_and_validates_required_fields(self):
         note_cls = getattr(xhs_main, "XiaoHongShuNote")
         app = note_cls(
