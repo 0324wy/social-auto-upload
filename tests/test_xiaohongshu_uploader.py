@@ -8,6 +8,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import uploader.xiaohongshu_uploader.main as xhs_main
 
 
+def make_async_locator(name, *, count=1, visible=True):
+    locator = MagicMock(name=name)
+    locator.first = locator
+    locator.count = AsyncMock(return_value=count)
+    locator.is_visible = AsyncMock(return_value=visible)
+    locator.wait_for = AsyncMock()
+    locator.scroll_into_view_if_needed = AsyncMock()
+    locator.hover = AsyncMock()
+    locator.click = AsyncMock()
+    locator.set_input_files = AsyncMock()
+    locator.element_handle = AsyncMock(return_value=object())
+    locator.get_attribute = AsyncMock(return_value=None)
+    return locator
+
+
 class FakeLocator:
     def __init__(self, name, count=0, src=None, children=None):
         self.name = name
@@ -203,6 +218,317 @@ class XiaohongshuUploaderTests(unittest.TestCase):
 
         self.assertTrue(app.file_path.endswith("demo.mp4"))
         self.assertTrue(app.thumbnail_path.endswith("demo.png"))
+
+    def test_wait_for_cover_entry_prefers_current_edit_control(self):
+        edit_entry = make_async_locator("edit-entry")
+        missing = make_async_locator("missing", count=0, visible=False)
+        page = MagicMock()
+        page.locator.side_effect = lambda selector: (
+            edit_entry
+            if selector == "div.cover-plugin-preview div.cover-edit-entry"
+            else missing
+        )
+
+        result = asyncio.run(xhs_main._wait_for_cover_entry(page))
+
+        self.assertIs(result, edit_entry)
+
+    def test_wait_for_cover_entry_supports_empty_cover_control(self):
+        upload_entry = make_async_locator("upload-entry")
+        missing = make_async_locator("missing", count=0, visible=False)
+        page = MagicMock()
+        page.locator.side_effect = lambda selector: (
+            upload_entry
+            if selector == "div.cover-plugin-preview div.upload-cover"
+            else missing
+        )
+
+        result = asyncio.run(xhs_main._wait_for_cover_entry(page))
+
+        self.assertIs(result, upload_entry)
+
+    def test_wait_for_cover_entry_dismisses_pk_cover_guide(self):
+        edit_entry = make_async_locator("edit-entry")
+        guide = make_async_locator("guide")
+        missing = make_async_locator("missing", count=0, visible=False)
+        page = MagicMock()
+        page.get_by_text.return_value = guide
+        page.wait_for_timeout = AsyncMock()
+        page.locator.side_effect = lambda selector: (
+            edit_entry
+            if selector == "div.cover-plugin-preview div.cover-edit-entry"
+            else missing
+        )
+
+        result = asyncio.run(xhs_main._wait_for_cover_entry(page))
+
+        self.assertIs(result, edit_entry)
+        guide.click.assert_awaited_once_with(force=True)
+
+    def test_wait_for_cover_entry_hovers_ai_cover_surface(self):
+        edit_entry = make_async_locator("edit-entry")
+        edit_entry.is_visible = AsyncMock(side_effect=[False, True])
+        surface = make_async_locator("cover-surface")
+        missing = make_async_locator("missing", count=0, visible=False)
+        guide = make_async_locator("guide", count=0, visible=False)
+        page = MagicMock()
+        page.get_by_text.return_value = guide
+        page.wait_for_timeout = AsyncMock()
+
+        def locate(selector):
+            if selector == "div.cover-plugin-preview div.cover-edit-entry":
+                return edit_entry
+            if selector == "div.cover-plugin-preview div.default--ai-cover-layout":
+                return surface
+            return missing
+
+        page.locator.side_effect = locate
+
+        result = asyncio.run(xhs_main._wait_for_cover_entry(page))
+
+        self.assertIs(result, edit_entry)
+        surface.hover.assert_awaited_once()
+
+    def test_set_thumbnail_uses_current_direct_upload_control(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="标题内容",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+        )
+        entry = make_async_locator("entry")
+        modal = make_async_locator("modal")
+        file_input = make_async_locator("file-input")
+        preview = make_async_locator("preview")
+        uploaded_thumbnail = make_async_locator("uploaded-thumbnail")
+        inactive_mask = make_async_locator("inactive-mask")
+        uploaded_thumbnail.locator.return_value = inactive_mask
+        complete = make_async_locator("complete")
+        current_surface = make_async_locator("current-surface")
+        current_surface.get_attribute.return_value = "background-image: url(old-cover)"
+        evaluating = make_async_locator("evaluating")
+
+        def locate_in_modal(selector):
+            if selector == xhs_main.COVER_FILE_INPUT_SELECTOR:
+                return file_input
+            if selector == xhs_main.COVER_UPLOADED_THUMBNAIL_SELECTOR:
+                return uploaded_thumbnail
+            return preview
+
+        modal.locator.side_effect = locate_in_modal
+        modal.get_by_role.return_value = complete
+
+        page = MagicMock()
+        page.locator.side_effect = lambda selector: (
+            current_surface
+            if selector == xhs_main.COVER_CURRENT_SURFACE_SELECTOR
+            else modal
+        )
+        page.wait_for_function = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        page.get_by_text.return_value = evaluating
+
+        with patch.object(
+            xhs_main,
+            "_wait_for_cover_entry",
+            new=AsyncMock(return_value=entry),
+        ):
+            asyncio.run(app.set_thumbnail(page, "cover.jpg"))
+
+        page.locator.assert_any_call(xhs_main.COVER_CURRENT_SURFACE_SELECTOR)
+        page.locator.assert_any_call(xhs_main.COVER_MODAL_SELECTOR)
+        modal.get_by_text.assert_not_called()
+        modal.locator.assert_any_call(xhs_main.COVER_FILE_INPUT_SELECTOR)
+        modal.locator.assert_any_call(xhs_main.COVER_PREVIEW_SELECTOR)
+        modal.locator.assert_any_call(xhs_main.COVER_UPLOADED_THUMBNAIL_SELECTOR)
+        modal.get_by_role.assert_called_once_with(
+            "button", name="完成", exact=True
+        )
+        file_input.set_input_files.assert_awaited_once_with("cover.jpg")
+        uploaded_thumbnail.click.assert_awaited_once_with(force=True)
+        inactive_mask.wait_for.assert_awaited_once_with(
+            state="hidden", timeout=xhs_main.COVER_IMAGE_TIMEOUT_MS
+        )
+        self.assertEqual(page.wait_for_function.await_count, 3)
+        evaluating.wait_for.assert_awaited_once_with(
+            state="hidden", timeout=xhs_main.COVER_IMAGE_TIMEOUT_MS
+        )
+        complete.click.assert_awaited_once_with(force=True)
+        self.assertEqual(
+            modal.wait_for.await_args_list,
+            [
+                unittest.mock.call(
+                    state="visible", timeout=xhs_main.COVER_MODAL_TIMEOUT_MS
+                ),
+                unittest.mock.call(
+                    state="hidden", timeout=xhs_main.COVER_MODAL_TIMEOUT_MS
+                ),
+            ],
+        )
+
+    def test_set_thumbnail_keeps_legacy_upload_tab_and_confirm_button(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="标题内容",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+        )
+        entry = make_async_locator("entry")
+        modal = make_async_locator("modal")
+        upload_tab = make_async_locator("upload-tab")
+        file_input = make_async_locator("file-input")
+        file_input.wait_for = AsyncMock(
+            side_effect=[TimeoutError("current editor input missing"), None]
+        )
+        preview = make_async_locator("preview")
+        uploaded_thumbnail = make_async_locator(
+            "missing-uploaded-thumbnail", count=0
+        )
+        missing_complete = make_async_locator("missing-complete", count=0)
+        confirm = make_async_locator("confirm")
+        modal.get_by_text.return_value = upload_tab
+
+        def locate_in_modal(selector):
+            if selector == xhs_main.COVER_FILE_INPUT_SELECTOR:
+                return file_input
+            if selector == xhs_main.COVER_UPLOADED_THUMBNAIL_SELECTOR:
+                return uploaded_thumbnail
+            return preview
+
+        modal.locator.side_effect = locate_in_modal
+        modal.get_by_role.side_effect = lambda _role, *, name, exact: (
+            missing_complete if name == "完成" else confirm
+        )
+
+        page = MagicMock()
+        missing_surface = make_async_locator("missing-surface", count=0)
+        page.locator.side_effect = lambda selector: (
+            missing_surface
+            if selector == xhs_main.COVER_CURRENT_SURFACE_SELECTOR
+            else modal
+        )
+        page.wait_for_function = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+
+        with patch.object(
+            xhs_main,
+            "_wait_for_cover_entry",
+            new=AsyncMock(return_value=entry),
+        ):
+            asyncio.run(app.set_thumbnail(page, "cover.jpg"))
+
+        modal.get_by_text.assert_called_once_with("上传封面", exact=True)
+        upload_tab.click.assert_awaited_once_with(force=True)
+        confirm.click.assert_awaited_once_with(force=True)
+
+    def test_set_thumbnail_stops_when_uploaded_cover_is_not_activated(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="标题内容",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+        )
+        entry = make_async_locator("entry")
+        modal = make_async_locator("modal")
+        file_input = make_async_locator("file-input")
+        preview = make_async_locator("preview")
+        uploaded_thumbnail = make_async_locator("uploaded-thumbnail")
+        inactive_mask = make_async_locator("inactive-mask")
+        inactive_mask.wait_for.side_effect = TimeoutError("still inactive")
+        uploaded_thumbnail.locator.return_value = inactive_mask
+        complete = make_async_locator("complete")
+        current_surface = make_async_locator("current-surface")
+        current_surface.get_attribute.return_value = "background-image: url(old-cover)"
+
+        def locate_in_modal(selector):
+            if selector == xhs_main.COVER_FILE_INPUT_SELECTOR:
+                return file_input
+            if selector == xhs_main.COVER_UPLOADED_THUMBNAIL_SELECTOR:
+                return uploaded_thumbnail
+            return preview
+
+        modal.locator.side_effect = locate_in_modal
+        modal.get_by_role.return_value = complete
+        page = MagicMock()
+        page.locator.side_effect = lambda selector: (
+            current_surface
+            if selector == xhs_main.COVER_CURRENT_SURFACE_SELECTOR
+            else modal
+        )
+        page.wait_for_function = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+        page.keyboard.press = AsyncMock()
+
+        with (
+            patch.object(
+                xhs_main,
+                "_wait_for_cover_entry",
+                new=AsyncMock(return_value=entry),
+            ),
+            self.assertRaisesRegex(RuntimeError, "自定义封面设置失败"),
+        ):
+            asyncio.run(app.set_thumbnail(page, "cover.jpg"))
+
+        uploaded_thumbnail.click.assert_awaited_once_with(force=True)
+        complete.click.assert_not_awaited()
+
+    def test_set_thumbnail_failure_stops_publish(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="标题内容",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+        )
+        page = MagicMock()
+        page.keyboard.press = AsyncMock()
+        page.wait_for_timeout = AsyncMock()
+
+        with (
+            patch.object(
+                xhs_main,
+                "_wait_for_cover_entry",
+                new=AsyncMock(side_effect=TimeoutError("missing")),
+            ),
+            self.assertRaisesRegex(RuntimeError, "自定义封面设置失败"),
+        ):
+            asyncio.run(app.set_thumbnail(page, "cover.jpg"))
+
+        page.keyboard.press.assert_awaited_once_with("Escape")
+
+    def test_thumbnail_error_prevents_clicking_publish(self):
+        app = xhs_main.XiaoHongShuVideo(
+            title="标题内容",
+            file_path="demo.mp4",
+            tags=[],
+            publish_date=0,
+            account_file="account.json",
+            thumbnail_path="cover.jpg",
+        )
+        upload_file = make_async_locator("upload-file")
+        upload_input = MagicMock()
+        preview = MagicMock()
+        preview.inner_text = AsyncMock(return_value="上传成功")
+        upload_input.query_selector = AsyncMock(return_value=preview)
+
+        page = MagicMock()
+        page.goto = AsyncMock()
+        page.wait_for_url = AsyncMock()
+        page.locator.return_value = upload_file
+        page.wait_for_selector = AsyncMock(return_value=upload_input)
+        app.fill_meta = AsyncMock()
+        app.set_thumbnail = AsyncMock(side_effect=RuntimeError("cover failed"))
+
+        with self.assertRaisesRegex(RuntimeError, "cover failed"):
+            asyncio.run(app.upload_video_content(page))
+
+        self.assertNotIn(
+            unittest.mock.call('button:has-text("发布")'),
+            page.locator.call_args_list,
+        )
 
     def test_note_uploader_exists_and_validates_required_fields(self):
         note_cls = getattr(xhs_main, "XiaoHongShuNote")

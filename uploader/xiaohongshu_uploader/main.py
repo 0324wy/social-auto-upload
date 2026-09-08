@@ -31,6 +31,35 @@ XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 XIAOHONGSHU_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
 VIDEO_UPLOAD_TIMEOUT_SECONDS = 15 * 60
 PUBLISH_TIMEOUT_SECONDS = 5 * 60
+COVER_ENTRY_TIMEOUT_MS = 120_000
+COVER_MODAL_TIMEOUT_MS = 30_000
+COVER_IMAGE_TIMEOUT_MS = 30_000
+COVER_ENTRY_SELECTORS = (
+    "div.cover-plugin-preview div.cover-edit-entry",
+    "div.cover-plugin-preview div.upload-cover",
+    "div.cover-plugin-preview div.default.pointer",
+)
+COVER_SURFACE_SELECTORS = (
+    "div.cover-plugin-preview div.default--ai-cover-layout",
+    "div.cover-plugin-preview div.default",
+)
+COVER_MODAL_SELECTOR = "div.d-modal.cover-modal:visible"
+COVER_FILE_INPUT_SELECTOR = (
+    'input[type="file"][aria-label="上传封面图片"], '
+    '#upload-cover-containner input[type="file"], '
+    'div.upload-wrapper input[type="file"][accept*="image"]'
+)
+COVER_PREVIEW_SELECTOR = (
+    'button.uploaded-thumbnail img[alt="已上传封面"], '
+    "img.uploaded-thumbnail-img, "
+    "#upload-cover-containner img.cropper"
+)
+COVER_UPLOADED_THUMBNAIL_SELECTOR = "button.uploaded-thumbnail"
+COVER_UPLOADED_INACTIVE_MASK_SELECTOR = ".uploaded-thumbnail-inactive-mask"
+COVER_CURRENT_SURFACE_SELECTOR = (
+    "div.cover-plugin-preview div.default--ai-cover-layout"
+)
+COVER_EVALUATING_TEXT = "封面效果评估中"
 
 
 def _build_xhs_creator_url(path: str) -> str:
@@ -79,6 +108,51 @@ async def _js_click_by_text(page: Page, text: str) -> bool:
         }""",
         text,
     )
+
+
+async def _wait_for_cover_entry(page: Page):
+    """Wait for either the current edit entry or an older empty-cover entry."""
+    deadline = monotonic() + COVER_ENTRY_TIMEOUT_MS / 1000
+    while monotonic() < deadline:
+        # Xiaohongshu can place a one-time PK-cover tour over this section.
+        # Dismiss it before trying to hover or click the underlying controls.
+        guide_confirm = page.get_by_text("我知道了", exact=True).first
+        try:
+            if await guide_confirm.count() and await guide_confirm.is_visible():
+                await guide_confirm.click(force=True)
+                await page.wait_for_timeout(500)
+                xiaohongshu_logger.info(_msg("🖼️", "已关闭 PK 封面功能引导"))
+        except Exception:
+            pass
+
+        for selector in COVER_ENTRY_SELECTORS:
+            candidate = page.locator(selector).first
+            if not await candidate.count():
+                continue
+            try:
+                if await candidate.is_visible():
+                    return candidate
+            except Exception:
+                continue
+
+        # With the current AI-cover layout, "编辑封面" is only exposed while
+        # hovering the generated first-frame tile.
+        for selector in COVER_SURFACE_SELECTORS:
+            surface = page.locator(selector).first
+            if not await surface.count():
+                continue
+            try:
+                if not await surface.is_visible():
+                    continue
+                await surface.hover()
+                await page.wait_for_timeout(250)
+                edit_entry = page.locator(COVER_ENTRY_SELECTORS[0]).first
+                if await edit_entry.count() and await edit_entry.is_visible():
+                    return edit_entry
+            except Exception:
+                continue
+        await page.wait_for_timeout(500)
+    raise TimeoutError("等待小红书封面入口超时")
 
 
 async def _emit_qrcode_callback(qrcode_callback, payload: dict):
@@ -586,58 +660,105 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
 
         xiaohongshu_logger.info(_msg("🖼️", "小人准备设置封面"))
 
-        # 封面设置为增强步骤：失败时记 warning 跳过、继续发布（用视频首帧兜底）。
         try:
-            # 发布页封面区域内嵌，点击 div.upload-cover 打开封面弹窗（d-modal）。
-            cover_section = page.locator("text=设置封面").first
+            # The current page renders "编辑封面" once the first frame exists and
+            # "设置封面" before that. Wait for either state instead of assuming
+            # that the title field means cover extraction has finished.
+            cover_entry = await _wait_for_cover_entry(page)
+            current_surface = page.locator(COVER_CURRENT_SURFACE_SELECTOR).first
+            previous_surface_style = None
+            if await current_surface.count():
+                previous_surface_style = await current_surface.get_attribute("style")
+            await cover_entry.scroll_into_view_if_needed(timeout=5000)
+            await cover_entry.click(force=True)
+
+            # Keep every ambiguous locator inside the active cover modal. The
+            # page also contains unrelated AI-cover upload buttons.
+            modal = page.locator(COVER_MODAL_SELECTOR).first
+            await modal.wait_for(state="visible", timeout=COVER_MODAL_TIMEOUT_MS)
+
+            file_input = modal.locator(COVER_FILE_INPUT_SELECTOR).first
             try:
-                await cover_section.scroll_into_view_if_needed(timeout=5000)
+                await file_input.wait_for(state="attached", timeout=10000)
             except Exception:
-                pass
-            await page.wait_for_timeout(2000)
-
-            # 1. 点击 div.upload-cover 打开封面弹窗
-            upload_cover = page.locator("div.upload-cover").first
-            if not await upload_cover.count():
-                upload_cover = page.locator("div.cover-plugin-preview div.default.pointer").first
-            await upload_cover.click(force=True)
-            await page.wait_for_timeout(3000)
-
-            # 2. 切换到「上传封面」tab（默认在「截取封面」）
-            upload_tab = page.get_by_text("上传封面", exact=True).first
-            await upload_tab.wait_for(state="visible", timeout=10000)
-            await upload_tab.click()
-            await page.wait_for_timeout(2000)
-
-            # 3. 找到图片 file input（parent class: upload-wrapper）并上传
-            file_input = page.locator('div.upload-wrapper input[type="file"][accept*="image"]').first
-            if not await file_input.count():
-                file_input = page.locator('input[type="file"][accept*="image"]').last
+                # Legacy editor: the image input is only attached after
+                # switching from frame extraction to the upload tab.
+                upload_tab = modal.get_by_text("上传封面", exact=True).first
+                await upload_tab.wait_for(state="visible", timeout=10000)
+                await upload_tab.click(force=True)
+                file_input = modal.locator(COVER_FILE_INPUT_SELECTOR).first
+                await file_input.wait_for(state="attached", timeout=10000)
             await file_input.set_input_files(thumbnail_path)
-            await page.wait_for_timeout(4000)  # 等图片加载+裁剪渲染
 
-            # 4. 点「确定」按钮
-            modal_footer = page.locator("div.d-modal-footer")
-            confirm = modal_footer.get_by_text("确定", exact=True).first
-            if not await confirm.count():
-                confirm = page.get_by_role("button", name="确定").first
-            await confirm.wait_for(state="visible", timeout=10000)
-            await confirm.click()
+            preview = modal.locator(COVER_PREVIEW_SELECTOR).first
+            await preview.wait_for(state="visible", timeout=COVER_IMAGE_TIMEOUT_MS)
+            await page.wait_for_function(
+                "img => img.complete && img.naturalWidth > 0",
+                arg=await preview.element_handle(),
+                timeout=COVER_IMAGE_TIMEOUT_MS,
+            )
 
-            # 5. 等弹窗关闭
-            modal = page.locator("div.d-modal")
-            try:
-                await modal.first.wait_for(state="hidden", timeout=15000)
-            except Exception:
-                pass
+            # In the current editor, uploading only adds an inactive thumbnail.
+            # It must be clicked before "完成" or Xiaohongshu keeps the video frame.
+            uploaded_thumbnail = modal.locator(
+                COVER_UPLOADED_THUMBNAIL_SELECTOR
+            ).first
+            uses_current_editor = bool(await uploaded_thumbnail.count())
+            if uses_current_editor:
+                await uploaded_thumbnail.wait_for(
+                    state="visible", timeout=COVER_IMAGE_TIMEOUT_MS
+                )
+                await page.wait_for_function(
+                    "button => !button.disabled",
+                    arg=await uploaded_thumbnail.element_handle(),
+                    timeout=COVER_IMAGE_TIMEOUT_MS,
+                )
+                await uploaded_thumbnail.click(force=True)
+                inactive_mask = uploaded_thumbnail.locator(
+                    COVER_UPLOADED_INACTIVE_MASK_SELECTOR
+                ).first
+                await inactive_mask.wait_for(
+                    state="hidden", timeout=COVER_IMAGE_TIMEOUT_MS
+                )
+
+            complete = modal.get_by_role("button", name="完成", exact=True).first
+            if not await complete.count():
+                complete = modal.get_by_role(
+                    "button", name="确定", exact=True
+                ).first
+            await complete.wait_for(state="visible", timeout=10000)
+            await complete.click(force=True)
+
+            await modal.wait_for(state="hidden", timeout=COVER_MODAL_TIMEOUT_MS)
+            if uses_current_editor:
+                if not previous_surface_style:
+                    raise RuntimeError("无法读取设置前的小红书封面状态")
+                await page.wait_for_function(
+                    """([selector, previousStyle]) => {
+                        const surface = document.querySelector(selector);
+                        return surface && surface.getAttribute('style') !== previousStyle;
+                    }""",
+                    arg=[COVER_CURRENT_SURFACE_SELECTOR, previous_surface_style],
+                    timeout=COVER_IMAGE_TIMEOUT_MS,
+                )
+                evaluating = page.get_by_text(
+                    COVER_EVALUATING_TEXT, exact=True
+                ).first
+                if await evaluating.count():
+                    await evaluating.wait_for(
+                        state="hidden", timeout=COVER_IMAGE_TIMEOUT_MS
+                    )
             xiaohongshu_logger.success(_msg("🥳", "封面已经设置完成"))
         except Exception as exc:
-            xiaohongshu_logger.warning(_msg("🖼️", f"封面设置失败，跳过该步骤继续发布（用视频首帧）：{exc}"))
+            xiaohongshu_logger.error(
+                _msg("🖼️", f"自定义封面设置失败，已停止发布：{exc}")
+            )
             try:
                 await page.keyboard.press("Escape")
                 await page.wait_for_timeout(500)
             except Exception:
                 pass
+            raise RuntimeError("小红书自定义封面设置失败，已停止发布") from exc
 
     async def upload_video_content(self, page: Page) -> None:
         xiaohongshu_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}.mp4"))
