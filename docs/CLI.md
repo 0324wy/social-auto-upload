@@ -12,6 +12,7 @@
 - `weibo`
 - `hupu`
 - `youtube`
+- `tiktok`（别名 `tk`）
 
 实现说明：
 
@@ -46,6 +47,7 @@ sau alipay --help
 sau weibo --help
 sau hupu --help
 sau youtube --help
+sau tiktok --help
 ```
 
 ## 安装 patchright 浏览器
@@ -162,10 +164,24 @@ sau alipay upload-video --account <account_name> --file videos/demo.mp4 --title 
 ```bash
 sau youtube login --account <account_name>
 sau youtube check --account <account_name>
-sau youtube upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --tags tag1,tag2 --playlist "我的系列" --visibility public
+sau youtube upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --tags tag1,tag2 --thumbnail videos/cover-16x9.jpg --playlist "我的系列" --visibility public --result-file results/youtube.json
 ```
 
 YouTube 登录需要在浏览器中完成 Google 账号登录，不使用二维码。`--visibility` 可选 `public`、`unlisted` 或 `private`，`--playlist` 可选。
+
+## TikTok CLI 子命令
+
+```bash
+sau tiktok login --account <account_name> --headed
+sau tiktok check --account <account_name>
+sau tiktok upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --tags tag1,tag2 --thumbnail videos/cover-3x4.jpg --visibility public --result-file results/tiktok.json
+```
+
+TikTok 登录也在可见 Chrome 窗口中完成，`tk` 与 `tiktok` 等价。可见性可选 `public`、`friends`、`private`。
+
+两个平台都支持 `--proxy` 和原子写入的 `--result-file`。明确指定封面时，封面验证失败会阻止提交。
+回执的 `success` 表示平台已接收；YouTube 的 `accepted_pending_processing` 仍在转码，需另行核验公开状态。
+`needs_verification` 表示提交结果不确定，复查该笔提交前不能重试；同一结果文件也会阻止重复提交。
 
 ## 微博 CLI 子命令
 

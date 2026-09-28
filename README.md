@@ -81,8 +81,8 @@
 | 支付宝生活号 | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | 浏览器自动化，支持生活号视频 |
 | 微博 | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | 浏览器自动化，标题最多 30 字 |
 | 虎扑 | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | 浏览器自动化，标题 4–40 字 |
-| TikTok | ✅ | ✅ | ❌ | ✅ | ❌ | ❌ | 当前示例走 Chrome 版实现 |
-| YouTube | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | 浏览器自动化（Studio），支持加入播放列表/可见性 |
+| TikTok | ✅ | ✅ | ❌ | ✅ | ✅ | ❌ | Chrome Studio，支持自定义封面、可见性和发布回执 |
+| YouTube | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ | Chrome Studio，支持封面、播放列表、可见性和发布回执 |
 
 ### AI这么强，为什么还需要这个项目
 在你使用AI的能力，browser agent等等，每次都让 agent 重新解析网页、截图理解, 临场判断
@@ -213,7 +213,12 @@ sau hupu upload-video --account <account_name> --file videos/demo.mp4 --title "�
 
 sau youtube login --account <account_name>
 sau youtube check --account <account_name>
-sau youtube upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --tags tag1,tag2 --playlist "我的系列" --visibility public
+sau youtube upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --tags tag1,tag2 --thumbnail videos/cover-16x9.jpg --visibility public --result-file results/youtube.json
+
+sau tiktok login --account <account_name> --headed
+sau tiktok check --account <account_name>
+sau tiktok upload-video --account <account_name> --file videos/demo.mp4 --title "示例标题" --desc "示例简介" --tags tag1,tag2 --thumbnail videos/cover-3x4.jpg --visibility public --result-file results/tiktok.json
+# tk 是 tiktok 的命令别名，例如 sau tk check --account main
 ```
 
 > YouTube 说明：登录是交互式的（Google 账号，浏览器里完成，无二维码）。这里走浏览器自动化而不是官方 API，
@@ -222,6 +227,22 @@ sau youtube upload-video --account <account_name> --file videos/demo.mp4 --title
 > `--playlist` 适合连载/系列追更；`--visibility` 可选 `public`/`unlisted`/`private`。
 > 上传会**等进度到 100% 再点发布**（浏览器上传靠窗口开着传，传一半就发布会被掐断卡在中途）。
 > youtube.com 被墙的地区：在 `conf.py` 设 `YT_PROXY = "http://127.0.0.1:7890"`（chromium 不吃系统代理，需显式指定）。
+
+YouTube 和 TikTok 的登录均在可见 Chrome 窗口中完成。登录状态分别保存到
+`cookies/youtube_<account_name>.json` 和 `cookies/tiktok_<account_name>.json`，不要提交账号文件。
+显式代理可用 `SAU_YOUTUBE_PROXY` / `SAU_TIKTOK_PROXY` 设置，登录、检查与上传使用同一代理配置。
+
+YouTube 普通视频与 Shorts 共用 `upload-video`。工具不会裁剪或重新编码视频：方形/竖屏且不超过 180 秒
+仅代表符合 Shorts 尺寸时长要求，最终类别以 Studio 的实际结果为准；横屏或更长视频按普通视频上传。
+指定 `--thumbnail` 时，封面未成功加载并保存会阻止发布，账号需要具备自定义封面权限。
+
+两个平台可用 `--result-file` 保存 JSON 回执，包含本次作品 ID、URL、平台状态、可见性和封面核验结果。
+`success` 表示平台已确认提交结果；`failed` 表示发布前失败或平台明确拒绝；`needs_verification`
+表示提交后结果不确定，需要按作品 ID 到 Studio 核对，不能直接重复上传。上传最多等待 30 分钟，
+提交确认最多等待 5 分钟；未收到明确回执不应当视为成功。TikTok 若显示审核/处理状态，需等待平台完成审核。
+YouTube 的 `accepted_pending_processing` 表示已确认接收、正在转码；此时
+`requested_visibility=public`、`observed_visibility=pending`，尚不能称为已公开。
+只有同一视频 ID 的实际可见性为 `public` 才能确认公开完成；已接收的视频应按原 ID 复核，不能重传。
 
 补充说明：
 

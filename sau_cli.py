@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import os
+import tempfile
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -66,6 +69,16 @@ from uploader.youtube_uploader.main import (
     cookie_auth as youtube_cookie_auth,
     youtube_setup,
 )
+
+from uploader.tk_uploader.main_chrome import (
+    TiktokVideo,
+    cookie_auth as tiktok_cookie_auth,
+    tiktok_setup,
+)
+
+class PreSubmissionError(RuntimeError):
+    submission_started = False
+
 
 SCHEDULE_FORMAT = "%Y-%m-%d %H:%M"
 
@@ -256,6 +269,21 @@ class YouTubeVideoUploadRequest:
     visibility: str = "public"
     debug: bool = True
     headless: bool = False
+    proxy: str | None = None
+
+
+@dataclass(slots=True)
+class TikTokVideoUploadRequest:
+    account_name: str
+    video_file: Path
+    title: str
+    description: str
+    tags: list[str]
+    thumbnail_file: Path | None = None
+    visibility: str = "public"
+    debug: bool = False
+    headless: bool = True
+    proxy: str | None = None
 
 
 def has_interactive_terminal() -> bool:
@@ -372,40 +400,104 @@ async def check_tencent_account(account_name: str) -> bool:
     return await tencent_cookie_auth(str(account_file))
 
 
-async def login_youtube_account(account_name: str, headless: bool = False) -> dict:
+async def login_youtube_account(account_name: str, headless: bool = False, proxy=None) -> dict:
     account_file = resolve_account_file("youtube", account_name)
-    return await youtube_setup(str(account_file), handle=True, return_detail=True, headless=headless)
+    return await youtube_setup(str(account_file), handle=True, return_detail=True, headless=headless, proxy=proxy)
 
 
-async def check_youtube_account(account_name: str) -> bool:
+async def check_youtube_account(account_name: str, headless: bool = True, proxy=None) -> bool:
     account_file = resolve_account_file("youtube", account_name)
     if not account_file.exists():
         return False
-    return await youtube_cookie_auth(str(account_file))
+    return await youtube_cookie_auth(str(account_file), headless=headless, proxy=proxy)
 
 
-async def upload_youtube_video(request: YouTubeVideoUploadRequest) -> Path:
+async def upload_youtube_video(request: YouTubeVideoUploadRequest) -> dict:
     account_file = resolve_account_file("youtube", request.account_name)
-    is_ready = await youtube_setup(str(account_file), handle=False)
+    is_ready = await youtube_setup(str(account_file), handle=False, headless=request.headless, proxy=request.proxy)
     if not is_ready:
-        raise RuntimeError(
-            f"YouTube cookie is missing or expired: {account_file}. Run `sau youtube login --account {request.account_name}` first."
-        )
-
+        raise PreSubmissionError(f"YouTube cookie is missing or expired: {account_file}. Run `sau youtube login --account {request.account_name}` first.")
     app = YouTubeVideo(
-        request.title,
-        str(request.video_file),
-        request.tags,
-        str(account_file),
+        request.title, str(request.video_file), request.tags, str(account_file),
         description=request.description,
         thumbnail_path=str(request.thumbnail_file) if request.thumbnail_file else None,
-        playlist=request.playlist,
-        visibility=request.visibility,
-        debug=request.debug,
-        headless=request.headless,
+        playlist=request.playlist, visibility=request.visibility,
+        debug=request.debug, headless=request.headless, proxy=request.proxy,
     )
-    await app.main()
-    return account_file
+    return await app.main()
+
+
+async def login_tiktok_account(account_name: str, headless: bool = False, proxy=None) -> dict:
+    account_file = resolve_account_file("tiktok", account_name)
+    return await tiktok_setup(str(account_file), handle=True, return_detail=True, headless=headless, proxy=proxy)
+
+
+async def check_tiktok_account(account_name: str, headless: bool = True, proxy=None) -> bool:
+    account_file = resolve_account_file("tiktok", account_name)
+    return account_file.is_file() and await tiktok_cookie_auth(str(account_file), headless=headless, proxy=proxy)
+
+
+async def upload_tiktok_video(request: TikTokVideoUploadRequest) -> dict:
+    account_file = resolve_account_file("tiktok", request.account_name)
+    if not await tiktok_setup(str(account_file), handle=False, headless=request.headless, proxy=request.proxy):
+        raise PreSubmissionError(f"TikTok cookie is missing or expired: {account_file}. Run `sau tiktok login --account {request.account_name}` first.")
+    caption = request.title + (("\n" + request.description) if request.description else "")
+    app = TiktokVideo(
+        caption, str(request.video_file), request.tags, 0, str(account_file),
+        str(request.thumbnail_file) if request.thumbnail_file else None,
+        headless=request.headless, proxy=request.proxy, visibility=request.visibility, debug=request.debug,
+    )
+    return await app.main()
+
+
+def _write_upload_receipt(path: Path | None, receipt: dict) -> None:
+    if path is None:
+        return
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    name = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, prefix=path.name + ".", suffix=".tmp", delete=False) as output:
+            name = output.name
+            json.dump(receipt, output, ensure_ascii=False, indent=2)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(name, path)
+    finally:
+        if name and Path(name).exists():
+            Path(name).unlink()
+
+
+async def _run_receipted_upload(platform, request, upload, result_file=None) -> int:
+    if result_file and Path(result_file).exists():
+        try:
+            previous = json.loads(Path(result_file).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("Existing upload receipt is unreadable; reconcile before retrying") from exc
+        if not isinstance(previous, dict) or previous.get("status") != "failed":
+            raise RuntimeError("Existing upload receipt may represent a published video; reconcile before retrying")
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    checkpoint = {"schema_version": 1, "platform": platform, "status": "needs_verification", "post_id": None,
+                  "url": None, "remote_status": "unknown", "visibility": request.visibility, "cover_verified": False,
+                  "content_kind": "unknown", "attempted_at": now, "finished_at": now,
+                  "error": "Upload attempt in progress; interruption requires reconciliation before retry"}
+    # Durable intent exists before any possible submit click, including process termination.
+    _write_upload_receipt(result_file, checkpoint)
+    try:
+        receipt = await upload(request)
+    except Exception as exc:
+        before_submission = getattr(exc, "submission_started", None) is False
+        receipt = dict(checkpoint, status="failed" if before_submission else "needs_verification",
+                       remote_status="not_submitted" if before_submission else "unknown", error=str(exc),
+                       finished_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    if not isinstance(receipt, dict) or receipt.get("schema_version") != 1 or receipt.get("platform") != platform or receipt.get("status") not in {"success", "failed", "needs_verification"}:
+        receipt = dict(checkpoint, error="Uploader did not return a valid receipt; reconcile before retrying")
+    if receipt.get("status") == "success" and (not receipt.get("post_id") or not receipt.get("url") or (request.thumbnail_file and receipt.get("cover_verified") is not True)):
+        receipt = dict(receipt, status="needs_verification", error="Uploader success lacks post identity or requested cover verification")
+    _write_upload_receipt(result_file, receipt)
+    print(json.dumps(receipt, ensure_ascii=False))
+    return 0 if receipt["status"] == "success" else (2 if receipt["status"] == "needs_verification" else 1)
 
 
 async def upload_video(request: DouyinVideoUploadRequest) -> Path:
@@ -1011,8 +1103,10 @@ def build_parser() -> argparse.ArgumentParser:
     for action_name in ("login", "check"):
         action_parser = youtube_actions.add_parser(action_name, help=f"YouTube {action_name}")
         action_parser.add_argument("--account", required=True, help="YouTube user-defined account_name")
+        add_runtime_flags(action_parser)
+        action_parser.add_argument("--proxy", default=None, help="Browser proxy; overrides SAU_YOUTUBE_PROXY / conf.YT_PROXY")
         if action_name == "login":
-            add_runtime_flags(action_parser)
+            action_parser.set_defaults(headless=False)
 
     youtube_upload_video_parser = youtube_actions.add_parser("upload-video", help="Upload one video to YouTube")
     youtube_upload_video_parser.add_argument("--account", required=True, help="YouTube user-defined account_name")
@@ -1024,7 +1118,30 @@ def build_parser() -> argparse.ArgumentParser:
     youtube_upload_video_parser.add_argument("--playlist", help="Optional playlist name to add the video to (for series)")
     youtube_upload_video_parser.add_argument(
         "--visibility", default="public", choices=["public", "unlisted", "private"], help="Video visibility")
+    youtube_upload_video_parser.add_argument("--proxy", default=None, help="Browser proxy; overrides SAU_YOUTUBE_PROXY / conf.YT_PROXY")
+    youtube_upload_video_parser.add_argument("--result-file", type=Path, help="Atomically write submission receipt JSON")
     add_runtime_flags(youtube_upload_video_parser)
+
+    tiktok_parser = platform_parsers.add_parser("tiktok", aliases=["tk"], help="TikTok operations")
+    tiktok_actions = tiktok_parser.add_subparsers(dest="action", required=True)
+    for action_name in ("login", "check"):
+        action_parser = tiktok_actions.add_parser(action_name, help=f"TikTok {action_name}")
+        action_parser.add_argument("--account", required=True, help="TikTok account alias")
+        action_parser.add_argument("--proxy", default=None, help="Browser proxy; overrides SAU_TIKTOK_PROXY / conf.TIKTOK_PROXY")
+        add_runtime_flags(action_parser)
+        if action_name == "login":
+            action_parser.set_defaults(headless=False)
+    tiktok_upload = tiktok_actions.add_parser("upload-video", help="Upload one video to TikTok")
+    tiktok_upload.add_argument("--account", required=True)
+    tiktok_upload.add_argument("--file", required=True, type=existing_file_path)
+    tiktok_upload.add_argument("--title", required=True)
+    tiktok_upload.add_argument("--desc", default="")
+    tiktok_upload.add_argument("--tags", default="", help="Comma-separated hashtags")
+    tiktok_upload.add_argument("--thumbnail", type=existing_file_path, help="Requested custom cover; failure blocks submission")
+    tiktok_upload.add_argument("--visibility", default="public", choices=["public", "friends", "private"])
+    tiktok_upload.add_argument("--proxy", default=None, help="Browser proxy; overrides SAU_TIKTOK_PROXY / conf.TIKTOK_PROXY")
+    tiktok_upload.add_argument("--result-file", type=Path, help="Atomically write submission receipt JSON")
+    add_runtime_flags(tiktok_upload)
 
     baijiahao_parser = platform_parsers.add_parser("baijiahao", help="Baidu Baijiahao operations")
     baijiahao_actions = baijiahao_parser.add_subparsers(dest="action", required=True)
@@ -1391,37 +1508,30 @@ async def dispatch(args: argparse.Namespace) -> int:
 
         raise RuntimeError(f"Unsupported Hupu action: {args.action}")
 
-    if args.platform == "youtube":
+    if args.platform in {"youtube", "tiktok", "tk"}:
+        platform = "tiktok" if args.platform == "tk" else args.platform
         if args.action == "login":
-            result = await login_youtube_account(args.account, headless=args.headless)
-            if not result["success"]:
-                raise RuntimeError(result["message"])
-            print(f"YouTube login flow completed: {result['account_file']}")
-            return 0
-
+            login = login_youtube_account if platform == "youtube" else login_tiktok_account
+            result = await login(args.account, headless=args.headless, proxy=args.proxy)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0 if result.get("success") else 1
         if args.action == "check":
-            is_valid = await check_youtube_account(args.account)
+            check = check_youtube_account if platform == "youtube" else check_tiktok_account
+            is_valid = await check(args.account, headless=args.headless, proxy=args.proxy)
             print("valid" if is_valid else "invalid")
             return 0 if is_valid else 1
-
         if args.action == "upload-video":
-            request = YouTubeVideoUploadRequest(
-                account_name=args.account,
-                video_file=args.file,
-                title=args.title,
-                description=args.desc,
-                tags=parse_tags(args.tags),
-                thumbnail_file=args.thumbnail,
-                playlist=args.playlist,
-                visibility=args.visibility,
-                debug=args.debug,
-                headless=args.headless,
-            )
-            await upload_youtube_video(request)
-            print(f"YouTube video upload submitted: {request.video_file}")
-            return 0
-
-        raise RuntimeError(f"Unsupported YouTube action: {args.action}")
+            values = dict(account_name=args.account, video_file=args.file, title=args.title, description=args.desc,
+                          tags=parse_tags(args.tags), thumbnail_file=args.thumbnail, visibility=args.visibility,
+                          debug=args.debug, headless=args.headless, proxy=args.proxy)
+            if platform == "youtube":
+                request = YouTubeVideoUploadRequest(**values, playlist=args.playlist)
+                upload = upload_youtube_video
+            else:
+                request = TikTokVideoUploadRequest(**values)
+                upload = upload_tiktok_video
+            return await _run_receipted_upload(platform, request, upload, args.result_file)
+        raise RuntimeError(f"Unsupported {platform} action: {args.action}")
 
     if args.platform == "baijiahao":
         if args.action == "login":
