@@ -2,6 +2,7 @@
 from datetime import datetime
 
 import asyncio
+import base64
 import inspect
 import os
 import sys
@@ -26,6 +27,32 @@ DOUYIN_PUBLISH_STRATEGY_IMMEDIATE = "immediate"
 DOUYIN_PUBLISH_STRATEGY_SCHEDULED = "scheduled"
 VIDEO_UPLOAD_TIMEOUT_SECONDS = 15 * 60
 PUBLISH_TIMEOUT_SECONDS = 5 * 60
+COVER_DIALOG_SELECTOR = "div.dy-creator-content-modal:visible"
+COVER_UPLOAD_SELECTOR = ".semi-upload:visible:has(.semi-upload-drag-area-main-text)"
+COVER_PREVIEW_SELECTOR = '[class*="cloudArea-"]:visible canvas.lower-canvas[class*="cloudImage-"]:visible'
+
+
+class DouyinCustomCoverError(RuntimeError):
+    """A requested custom cover was not verified; publishing must stop."""
+
+
+def _same_cover_preview(first: str, second: str) -> bool:
+    """Compare 32x32 RGB samples, allowing minor JPEG/canvas redraw differences."""
+    if first == second:
+        return True
+    try:
+        first_kind, first_size, first_data = first.split(":", 2)
+        second_kind, second_size, second_data = second.split(":", 2)
+        if first_kind != "canvas-rgb32" or second_kind != first_kind or first_size != second_size:
+            return False
+        left = base64.b64decode(first_data, validate=True)
+        right = base64.b64decode(second_data, validate=True)
+        if len(left) != 32 * 32 * 3 or len(right) != len(left):
+            return False
+        differences = [abs(a - b) for a, b in zip(left, right)]
+        return sum(differences) / len(differences) <= 3 and sorted(differences)[int(len(differences) * 0.95)] <= 12
+    except (ValueError, TypeError):
+        return False
 
 
 def _msg(emoji: str, text: str) -> str:
@@ -673,6 +700,8 @@ class DouYinVideo(DouYinBaseUploader):
         self.tags = tags
         self.thumbnail_landscape_path = thumbnail_landscape_path
         self.thumbnail_portrait_path = thumbnail_portrait_path
+        self._custom_covers_verified = False
+        self._verified_cover_sources = {}
         self.productLink = productLink
         self.productTitle = productTitle
         self.desc = desc or ""
@@ -810,6 +839,9 @@ class DouYinVideo(DouYinBaseUploader):
         await page.locator('div.progress-div [class^="upload-btn-input"]').set_input_files(self.file_path)
 
     async def handle_auto_video_cover(self, page):
+        if self.thumbnail_landscape_path or self.thumbnail_portrait_path:
+            await self._assert_custom_covers_ready(page)
+            return False
         if await page.get_by_text("请设置封面后再发布").first.is_visible():
             douyin_logger.info(_msg("🧍", "发布前还得先把封面弄好"))
             recommend_cover = page.locator('[class^="recommendCover-"]').first
@@ -830,159 +862,283 @@ class DouYinVideo(DouYinBaseUploader):
                     douyin_logger.warning(_msg("😵", f"推荐封面没选成功: {e}"))
         return False
 
-    async def set_thumbnail(self, page: Page):
+    async def _assert_custom_covers_ready(self, page: Page) -> None:
         if not self.thumbnail_landscape_path and not self.thumbnail_portrait_path:
             return
+        if not self._custom_covers_verified:
+            raise DouyinCustomCoverError("自定义封面尚未验证保存成功，拒绝继续发布")
+        if await page.locator(COVER_DIALOG_SELECTOR).count():
+            raise DouyinCustomCoverError("自定义封面编辑器仍然打开，拒绝继续发布")
+        warning = page.get_by_text("请设置封面后再发布").first
+        if await warning.count() and await warning.is_visible():
+            raise DouyinCustomCoverError("平台提示自定义封面未设置成功，拒绝替换为推荐封面")
+        for orientation, expected_src in self._verified_cover_sources.items():
+            snapshot = await self._saved_cover_snapshot(page, orientation)
+            if snapshot.get("src") != expected_src or not snapshot.get("loaded"):
+                raise DouyinCustomCoverError(f"已保存的自定义{orientation}封面预览发生变化或尚未加载，拒绝继续发布")
 
-        douyin_logger.info(_msg("🏃", "小人正在设置视频封面"))
-        # 先清掉 shepherd 新手引导浮层，否则它会拦截封面点击导致弹窗打不开
+    async def _saved_cover_snapshot(self, page: Page, orientation: str) -> dict:
+        label = "竖封面3:4" if orientation == "portrait" else "横封面4:3"
+        card = page.locator('[class^="coverControl-"]').filter(has_text=label)
+        if await card.count() != 1:
+            raise DouyinCustomCoverError(f"未找到唯一的已保存封面预览「{label}」")
+        image = card.locator("img")
+        if await image.count() != 1:
+            raise DouyinCustomCoverError(f"已保存封面预览「{label}」没有唯一图片")
+        return await image.evaluate(
+            """img => ({src: img.currentSrc || img.src, loaded: img.complete && img.naturalWidth > 0 && img.naturalHeight > 0,
+                        width: img.naturalWidth, height: img.naturalHeight})"""
+        )
+
+    async def _wait_for_saved_covers(self, page: Page, baselines: dict[str, str]) -> dict[str, str]:
+        # Closing the editor starts an asynchronous cover job. Only the main form's
+        # requested cards, not the phone mockup or AI recommendations, prove it has completed.
+        for _ in range(120):
+            saved = {}
+            for orientation, previous_src in baselines.items():
+                snapshot = await self._saved_cover_snapshot(page, orientation)
+                src = snapshot.get("src")
+                if src and src != previous_src and snapshot.get("loaded"):
+                    saved[orientation] = src
+            if len(saved) == len(baselines):
+                return saved
+            await page.wait_for_timeout(500)
+        missing = ", ".join(orientation for orientation in baselines if orientation not in saved)
+        raise DouyinCustomCoverError(f"封面保存后 60 秒内未能确认主表单图片更新并加载（{missing}），拒绝继续发布")
+
+    async def _open_cover_editor(self, page: Page):
         await page.evaluate(
             "() => document.querySelectorAll('.shepherd-element,.shepherd-modal-overlay-container').forEach(e=>e.remove())"
         )
-
         cover_area = page.locator('[class*="cover-"]').filter(has=page.locator("img")).first
         if not await cover_area.count():
             cover_area = page.locator('[class*="cover"]').first
-
-        # 打开封面弹窗：抖音组件对普通/force click 常静默无效（和"完成"按钮同病），
-        # 统一用 _native_click 派发完整原生事件序列；点后校验弹窗是否出现，没出现就重试。
-        cover_locator_str = 'div.dy-creator-content-modal'
-        cover_locator = page.locator(cover_locator_str).first
-        opened = False
-        # 刚上传完页面还在过渡，先等封面区渲染稳定，去掉"页面没稳就点空"这个诱因
+        cover = page.locator(COVER_DIALOG_SELECTOR).first
         try:
             await cover_area.wait_for(state="visible", timeout=8000)
         except Exception:
             pass
         await page.wait_for_timeout(1500)
-        for attempt in range(5):
-            # hover 若干次，等「编辑封面/选择封面」入口真正浮现，避免回退到封面区中心点空
-            trigger = None
-            trigger_txt = "封面区域"
-            for _ in range(3):
-                try:
-                    await cover_area.hover(force=True)
-                    await page.wait_for_timeout(600)
-                except Exception:
-                    pass
-                for txt in ["编辑封面", "选择封面", "设置封面"]:
-                    t = page.get_by_text(txt, exact=True).first
-                    if await t.count() and await t.is_visible():
-                        trigger, trigger_txt = t, txt
-                        break
-                if trigger is not None:
-                    break
-            if trigger is None:
-                trigger = cover_area
-            # 每轮都用 _native_click（force click 对抖音自定义组件常静默失效，白耗时间）
-            await _native_click(page, trigger)
-            douyin_logger.info(_msg("🖼️", f"已点「{trigger_txt}」尝试打开封面弹窗(第{attempt + 1}次)"))
+        for _ in range(5):
+            trigger = cover_area
             try:
-                await page.wait_for_selector(cover_locator_str, timeout=5000)
-                opened = True
-                break
+                await cover_area.hover(force=True)
+            except Exception:
+                pass
+            for label in ["编辑封面", "选择封面", "设置封面"]:
+                candidate = page.get_by_text(label, exact=True).first
+                if await candidate.count() and await candidate.is_visible():
+                    trigger = candidate
+                    break
+            await _native_click(page, trigger)
+            try:
+                await cover.wait_for(state="visible", timeout=5000)
+                return cover
             except Exception:
                 continue
-        if not opened:
-            douyin_logger.warning(_msg("⚠️", "封面弹窗打不开，跳过自定义封面继续发布（交给推荐封面兜底）"))
-            return
+        raise DouyinCustomCoverError("无法打开自定义封面编辑器，拒绝继续发布")
 
-        await page.wait_for_timeout(1500)
-
-        # 封面弹窗内有两个 input.semi-upload-hidden-input（各自还带一个 -replace 兄弟）：
-        #   ① 左侧「生成参考图」(AI封面参考图)——drag 区是 semi-upload-drag-area-custom，只有个 + 图标；
-        #   ② 帧选择区「上传封面」——drag 区含 .semi-upload-drag-area-main-text「点击上传文件或拖拽…」。
-        # 旧代码用 .first 取到了①，封面被塞进 AI 参考图槽→真封面没设上、检测/AI生成一直转，
-        # 「完成」永远关不掉弹窗→挡住发布→超时（用户 F12 实测的真根因）。
-        # 改为按 main-text 拖拽区精确定位②的上传 input，取不到再 .last 兜底。
-        cover_upload = cover_locator.locator(
-            '.semi-upload:has(.semi-upload-drag-area-main-text) input.semi-upload-hidden-input'
-        ).first
-        if await cover_upload.count() == 0:
-            cover_upload = cover_locator.locator("input.semi-upload-hidden-input").last
-
-        if self.thumbnail_portrait_path:
-            # 弹窗默认就在“设置竖封面”页；防御性点一下 tab（已激活则忽略）
+    async def _select_cover_tab(self, page: Page, cover, label: str) -> None:
+        tab = cover.get_by_text(label, exact=True).first
+        if not await tab.count() or not await tab.is_visible():
+            raise DouyinCustomCoverError(f"未找到自定义封面标签「{label}」")
+        for _ in range(3):
             try:
-                await cover_locator.get_by_text("设置竖封面", exact=True).first.click(timeout=3000)
-                await page.wait_for_timeout(800)
+                await tab.click(timeout=3000)
             except Exception:
-                pass
-            await cover_upload.set_input_files(self.thumbnail_portrait_path)
-            await page.wait_for_timeout(3000)
-            douyin_logger.info(_msg("🖼️", "竖版封面已上传到预览"))
-        elif self.thumbnail_landscape_path:
-            try:
-                await cover_locator.get_by_text("设置横封面", exact=True).first.click(timeout=3000)
-                await page.wait_for_timeout(800)
-            except Exception:
-                pass
-            await cover_upload.set_input_files(self.thumbnail_landscape_path)
-            await page.wait_for_timeout(3000)
-            douyin_logger.info(_msg("🖼️", "横版封面已上传到预览"))
-
-        # ── 等"完成"按钮解禁：封面图处理完成前，"完成"是 semi-button-disabled，点了无效 ──
-        def _finish_btn():
-            return cover_locator.get_by_role("button", name="完成", exact=True).first
-
-        for _ in range(30):  # 最多 ~15s 等图片处理、按钮解禁
-            try:
-                b = _finish_btn()
-                if await b.count():
-                    cls = await b.get_attribute("class") or ""
-                    if "semi-button-disabled" not in cls:
-                        break
-            except Exception:
-                pass
+                await _native_click(page, tab)
             await page.wait_for_timeout(500)
+            selected = await tab.evaluate(
+                r"""el => {
+                    for (let node = el, depth = 0; node && depth < 4; node = node.parentElement, depth++) {
+                        if (node.getAttribute('aria-selected') === 'true' || node.getAttribute('data-state') === 'active') return true;
+                        const cls = String(node.className || '');
+                        if (/(^|[-_\s])(?:active|selected)(?:[-_\s]|$)|(?:Active|Selected)(?:[-_\s]|$)/.test(cls)) return true;
+                        if (node.getAttribute('role') === 'tab') return false;
+                    }
+                    return false;
+                }"""
+            )
+            if selected:
+                return
+            await _native_click(page, tab)
+        raise DouyinCustomCoverError(f"无法确认自定义封面标签「{label}」已激活")
 
-        # ── 点"完成"并验证弹窗真正 detach ──
-        # 抖音自定义组件普通 click 可能不抛异常也不生效，所以每轮点后都校验弹窗是否消失：
-        # 消失才算成功；否则升级 _native_click、处理可能的二次确认、最后 Esc 兜底。
-        closed = False
-        for attempt in range(4):
-            btn = _finish_btn()
-            if not await btn.count():
-                btn = cover_locator.locator("button.semi-button").filter(has_text="完成").first
-            if await btn.count() and await btn.is_visible():
+    async def _loaded_cover_previews(self, cover, orientation: str) -> set[str]:
+        # Verified creator DOM: the editable image is the lower Fabric canvas in cloudArea.
+        # AI/gallery images, the upper interaction canvas and the small phone previews are not evidence.
+        canvas = cover.locator(COVER_PREVIEW_SELECTOR)
+        count = await canvas.count()
+        if count == 0:
+            return set()
+        if count != 1:
+            raise DouyinCustomCoverError(f"自定义{orientation}封面的主编辑画布不唯一")
+        signature = await canvas.evaluate(
+            """canvas => {
+                if (!canvas.width || !canvas.height) return '';
+                try {
+                    const sample = document.createElement('canvas');
+                    sample.width = sample.height = 32;
+                    const context = sample.getContext('2d');
+                    context.drawImage(canvas, 0, 0, 32, 32);
+                    const pixels = context.getImageData(0, 0, 32, 32).data;
+                    const minimum = [255, 255, 255], maximum = [0, 0, 0];
+                    let rgb = '', painted = 0;
+                    for (let i = 0; i < pixels.length; i += 4) {
+                        if (pixels[i + 3] > 0) painted++;
+                        for (let channel = 0; channel < 3; channel++) {
+                            const value = pixels[i + channel];
+                            minimum[channel] = Math.min(minimum[channel], value);
+                            maximum[channel] = Math.max(maximum[channel], value);
+                            rgb += String.fromCharCode(value);
+                        }
+                    }
+                    // A transparent or uniformly blank loading canvas is not artwork evidence.
+                    if (painted < 32 || Math.max(...maximum.map((value, channel) => value - minimum[channel])) < 16) return '';
+                    return `canvas-rgb32:${canvas.width}x${canvas.height}:${btoa(rgb)}`;
+                } catch (_) { return ''; }
+            }"""
+        )
+        return {signature} if signature else set()
+
+    async def _cover_finish_enabled(self, cover) -> bool:
+        button = cover.get_by_role("button", name="完成", exact=True).first
+        if not await button.count() or not await button.is_visible() or not await button.is_enabled():
+            return False
+        return (
+            await button.get_attribute("aria-disabled") != "true"
+            and "semi-button-disabled" not in (await button.get_attribute("class") or "")
+        )
+
+    async def _wait_for_cover_preview(self, page, cover, orientation, *, baseline=None, expected=None) -> set[str]:
+        previous_matches = set()
+        for _ in range(60):
+            for message in ["上传失败", "图片上传失败", "图片处理失败"]:
+                failure = cover.get_by_text(message, exact=True).first
+                if await failure.count() and await failure.is_visible():
+                    raise DouyinCustomCoverError(f"自定义{orientation}封面处理失败：{message}")
+            previews = await self._loaded_cover_previews(cover, orientation)
+            if expected is not None:
+                matches = {preview for preview in previews if any(_same_cover_preview(preview, wanted) for wanted in expected)}
+            else:
+                matches = {preview for preview in previews if not any(_same_cover_preview(preview, previous) for previous in baseline or set())}
+            if matches and await self._cover_finish_enabled(cover):
+                stable = {preview for preview in matches if any(_same_cover_preview(preview, previous) for previous in previous_matches)}
+                if stable:
+                    return stable
+                previous_matches = matches
+            else:
+                previous_matches = set()
+            await page.wait_for_timeout(500)
+        raise DouyinCustomCoverError(f"未能验证自定义{orientation}封面的已加载预览或完成按钮状态")
+
+    async def _upload_custom_cover(self, page, cover, label, orientation, path) -> set[str]:
+        await self._select_cover_tab(page, cover, label)
+        # Only the visible real cover slot has main-text. Never use the AI reference slot or an arbitrary last input.
+        slot = cover.locator(COVER_UPLOAD_SELECTOR)
+        if await slot.count() != 1:
+            raise DouyinCustomCoverError(f"「{label}」未找到唯一可见的真实封面上传槽")
+        upload = slot.locator("input.semi-upload-hidden-input").first
+        await upload.wait_for(state="attached", timeout=5000)
+        baseline = await self._loaded_cover_previews(cover, orientation)
+        # The site's onChange handler clears input.files. Record the selected name before
+        # React's handler runs; the JSHandle also survives replacement of the input node.
+        selection = await upload.evaluate_handle(
+            """el => {
+                const view = el.ownerDocument.defaultView;
+                const state = {name: ''};
+                const record = event => {
+                    if (event.target !== el) return;
+                    state.name = el.files && el.files[0] ? el.files[0].name : '';
+                    state.cleanup();
+                };
+                state.cleanup = () => view.removeEventListener('change', record, true);
+                view.addEventListener('change', record, {capture: true});
+                return state;
+            }"""
+        )
+        try:
+            await upload.set_input_files(path)
+            selected_file = await selection.evaluate("state => state.name")
+        finally:
+            try:
+                await selection.evaluate("state => state.cleanup()")
+            finally:
+                await selection.dispose()
+        if selected_file != Path(path).name:
+            raise DouyinCustomCoverError(f"「{label}」未接受指定的封面文件")
+        previews = await self._wait_for_cover_preview(page, cover, orientation, baseline=baseline)
+        douyin_logger.info(_msg("🖼️", f"「{label}」指定文件已上传，预览已加载"))
+        return previews
+
+    async def _save_custom_covers(self, page, cover) -> None:
+        for _ in range(4):
+            if not await self._cover_finish_enabled(cover):
+                raise DouyinCustomCoverError("自定义封面完成按钮不可用，拒绝继续发布")
+            finish = cover.get_by_role("button", name="完成", exact=True).first
+            try:
+                await finish.click(timeout=4000)
+            except Exception:
+                await _native_click(page, finish)
+            try:
+                await cover.wait_for(state="hidden", timeout=3000)
+                return
+            except Exception:
+                pass
+            # Only explicit cover completion confirmations are accepted; Escape would cancel, not save.
+            confirmation = page.locator(".semi-modal-content:visible").filter(has_text="封面")
+            for name in ["确定", "确认", "仍然完成", "仍要完成"]:
+                button = confirmation.get_by_role("button", name=name, exact=True).first
+                if await button.count() and await button.is_visible():
+                    await _native_click(page, button)
+                    break
+            try:
+                await cover.wait_for(state="hidden", timeout=3000)
+                return
+            except Exception:
+                await _native_click(page, finish)
                 try:
-                    await btn.click(timeout=4000)
+                    await cover.wait_for(state="hidden", timeout=3000)
+                    return
                 except Exception:
                     pass
-                await page.wait_for_timeout(1500)
-                if await cover_locator.count() == 0:
-                    closed = True
-                    break
-                # 普通点没关掉 → 派发完整原生事件序列
-                await _native_click(page, btn)
-                await page.wait_for_timeout(1500)
-                if await cover_locator.count() == 0:
-                    closed = True
-                    break
+        raise DouyinCustomCoverError("自定义封面点击完成后未能确认保存关闭，拒绝继续发布")
 
-            # 点"完成"后抖音可能弹二次确认（如未设横封面时问"确定完成？"）→ 点确认类按钮
-            for cname in ["确定", "确认", "仍然完成", "仍要完成", "继续"]:
-                confirm = page.locator(".semi-modal-content").get_by_role("button", name=cname, exact=True).first
-                if await confirm.count() and await confirm.is_visible():
-                    await _native_click(page, confirm)
-                    await page.wait_for_timeout(1500)
-                    break
-            if await cover_locator.count() == 0:
-                closed = True
-                break
-
-            # 仍没关掉：Esc 兜底后再验证一次
-            douyin_logger.debug(_msg("🖼️", f"封面「完成」后弹窗未关，重试(第{attempt + 1}次)"))
-            await page.keyboard.press("Escape")
-            await page.wait_for_timeout(1000)
-            if await cover_locator.count() == 0:
-                closed = True
-                break
-
-        if closed:
-            douyin_logger.info(_msg("🥳", "视频封面设置完成，弹窗已关闭"))
-        else:
-            douyin_logger.warning(_msg("⚠️", "封面弹窗未能关闭，可能挡住自主声明/发布"))
+    async def set_thumbnail(self, page: Page):
+        self._custom_covers_verified = False
+        self._verified_cover_sources = {}
+        requested = [
+            ("设置竖封面", "portrait", self.thumbnail_portrait_path),
+            ("设置横封面", "landscape", self.thumbnail_landscape_path),
+        ]
+        requested = [item for item in requested if item[2]]
+        if not requested:
+            return
+        try:
+            baselines = {}
+            for _, orientation, _ in requested:
+                snapshot = await self._saved_cover_snapshot(page, orientation)
+                baselines[orientation] = snapshot.get("src", "")
+            cover = await self._open_cover_editor(page)
+            verified = []
+            for label, orientation, path in requested:
+                previews = await self._upload_custom_cover(page, cover, label, orientation, path)
+                verified.append((label, orientation, previews))
+            # Revisit both tabs before saving: the second upload must not have replaced the first tab's cover.
+            for label, orientation, previews in verified:
+                await self._select_cover_tab(page, cover, label)
+                await self._wait_for_cover_preview(page, cover, orientation, expected=previews)
+            await self._save_custom_covers(page, cover)
+            self._verified_cover_sources = await self._wait_for_saved_covers(page, baselines)
+            self._custom_covers_verified = True
+            await self._assert_custom_covers_ready(page)
+        except Exception as exc:
+            self._custom_covers_verified = False
+            self._verified_cover_sources = {}
+            if isinstance(exc, DouyinCustomCoverError):
+                raise
+            raise DouyinCustomCoverError(f"自定义封面设置失败，拒绝继续发布：{exc}") from exc
+        douyin_logger.info(_msg("🥳", "所有指定封面均已验证预览并通过完成按钮保存；发布前检查通过"))
 
 
     async def upload(self, playwright: Playwright) -> None:
@@ -1116,6 +1272,7 @@ class DouYinVideo(DouYinBaseUploader):
                             sms_prompt_logged = True
 
                     # ── 正常发布流程 ──
+                    await self._assert_custom_covers_ready(page)
                     publish_button = page.get_by_role("button", name="发布", exact=True)
                     if await publish_button.count():
                         await publish_button.click(force=True)
@@ -1125,6 +1282,8 @@ class DouYinVideo(DouYinBaseUploader):
                     )
                     douyin_logger.success(_msg("🥳", "视频发布成功，小人开心收工"))
                     break
+                except DouyinCustomCoverError:
+                    raise
                 except Exception:
                     await self.handle_auto_video_cover(page)
                     douyin_logger.info(_msg("🏃", "小人正在冲刺发布视频"))
